@@ -1,5 +1,4 @@
 import cdsapi
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import os
 from datetime import datetime, date
@@ -12,7 +11,7 @@ def download_era5_data(
         current_date,
         mode="hourly",
         daily_statistic=None,
-        frequency="4_hourly",
+        frequency="1_hourly",
         time_zone="utc+00:00",
         times=None,
         pressure_levels=None,
@@ -189,9 +188,6 @@ def download_era5_data(
         ):
             raise ValueError("Grid resolution values must be positive numbers")
 
-    if  grid_resolution is None:
-        grid_resolution = [1.0, 1.0]
-
     # 10. Validate daily statistics
     valid_statistics = {
         "mean",
@@ -200,7 +196,10 @@ def download_era5_data(
     }
     if mode == "daily":
 
-        if daily_statistic is None or daily_statistic not in valid_statistics:
+        if daily_statistic is None:
+            daily_statistic = "mean"
+
+        if daily_statistic not in valid_statistics:
             raise ValueError(f"'daily_statistic' must be one of {valid_statistics}")
 
         daily_statistic = "daily_" + daily_statistic
@@ -363,7 +362,7 @@ def download_era5_data_for_period(
     date_to,
     mode="hourly",
     daily_statistic=None,
-    frequency="4_hourly",
+    frequency="1_hourly",
     time_zone="utc+00:00",
     times=None,
     pressure_levels=None,
@@ -449,44 +448,59 @@ def download_era5_data_for_period(
     downloaded_files = []
 
     # Generate dates based on the selected mode
+
+    # Parse dates
+    try:
+        start_date = datetime.strptime(date_from, "%d-%m-%Y")
+        end_date = datetime.strptime(date_to, "%d-%m-%Y")
+
+    except (TypeError, ValueError):
+        raise ValueError("'date_from' and 'date_to' must have format 'DD-MM-YYYY'")
+
+    # Validate date range
+    if start_date > end_date:
+        raise ValueError("'date_from' must not be later than 'date_to'")
+
+    # Generate dates
     if mode in {"hourly", "daily"}:
 
         dates = pd.date_range(
-            start=date_from,
-            end=date_to,
+            start=start_date,
+            end=end_date,
             freq="D"
         )
 
     elif mode == "monthly":
 
         dates = pd.date_range(
-            start=date_from.replace(day=1),
-            end=date_to.replace(day=1),
+            start=start_date.replace(day=1),
+            end=end_date.replace(day=1),
             freq="MS"
         )
 
-    for date in dates:
+    for dd in dates:
 
         try:
             result = download_era5_data(
                 output_dir=output_dir,
                 variable=variable,
-                current_date=date.strftime("%d-%m-%Y"),
+                current_date=dd.strftime("%d-%m-%Y"),
                 times=times,
-                area=area,
-                pressure_levels=pressure_levels,
-                file_format=file_format,
-                grid_resolution=grid_resolution,
                 mode=mode,
                 daily_statistic=daily_statistic,
                 frequency=frequency,
-                time_zone=time_zone
+                time_zone=time_zone,
+                area=area,
+                grid_resolution=grid_resolution,
+                pressure_levels=pressure_levels,
+                file_format=file_format,
+
             )
 
             if result:
                 downloaded_files.append(result)
 
         except Exception as e:
-            print("Download failed for %s: %s", date.strftime("%Y-%m-%d"), e)
+            print("Download failed for %s: %s", dd.strftime("%Y-%m-%d"), e)
 
     return downloaded_files

@@ -39,5 +39,27 @@ The ERA5 dataset provides hourly estimates of a large number of atmospheric, lan
     
   * <a href="https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land?tab=overview" target="_blank">ERA5-Land hourly data from 1950 to present</a>
 
-# ERA5 API
+# Download data from the ERA5 API
 
+To load ERA5 data from Jupyter NRTBuc using Python, you typically access the data via the CDS (Climate Data Store) API provided by ECMWF. Here's a basic step-by-step guide to do that:
+
+```Step 1: Set Up Your CDS API Key```
+
+Register for a CDS account at ECMWF CDS. url: https://cds.climate.copernicus.eu/
+
+After registration, you can find your url and key here: url: https://cds.climate.copernicus.eu/how-to-api
+
+Set the API key by placing the .cdsapirc file in your home directory (C:\Users\username) with the following content:
+
+```python
+url: https://cds.climate.copernicus.eu/api/v2
+
+key: your-api-key
+```
+
+```Step 2: Install Required Packages```
+You need the cdsapi library to access ECMWF data. You can install it using:
+
+```python
+pip install cdsapi
+```
