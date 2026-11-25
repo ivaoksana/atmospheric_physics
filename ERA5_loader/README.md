@@ -14,7 +14,10 @@
 
 * In the context of the ERA5 model, an ensemble member refers to one of the ten individual model realizations that are run with slightly different initial conditions. These ensemble members include small perturbations in atmospheric variables based on the data error. The ensemble is required for the data assimilation procedure, but as a by-product also provides an estimate of the relative, random uncertainty. The ensemble members are identified by a number ranging from 0 to 9. The ensemble mean is typically calculated as the mean of all ensemble members.
 
-* The ERA5 provides global, hourly estimates of atmospheric, ocean-wave, and land-surface variables. The data cover the Earth on a 30km grid and resolve the atmosphere using 137 levels from the surface up to a height of 80km. However, it’s also available on regular latitude-longitude grids at 0.25 x 0.25 degree resolution. The native spatial resolution of the ERA5-Land reanalysis dataset is 9km on a reduced Gaussian grid (TCo1279). ERA5 is updated daily with a latency of about 5 days (monthly means are available around the 6th of each month).
+* The ERA5 provides global, hourly estimates of atmospheric, ocean-wave, and land-surface variables. The data cover the Earth on a 30km grid and resolve the atmosphere using 137 levels from the surface up to a height of 80km. However, it’s also available on regular latitude-longitude grids at 0.25 x 0.25 degree resolution. The native spatial resolution of the ERA5-Land reanalysis dataset is 9km on a reduced Gaussian grid (TCo1279). 
+ 
+* ERA5 is updated regularly. Near-real-time ERA5T data are generally
+available with a delay of about 5 days. Monthly means are typically available about 5 days after the end of the month. Availability times are not guaranteed.
 
 * The ERA5 reanalisys product has 37 pressure levels not 137 as model!
 
@@ -41,25 +44,110 @@ The ERA5 dataset provides hourly estimates of a large number of atmospheric, lan
 
 # Download data from the ERA5 API
 
-To load ERA5 data from Jupyter NRTBuc using Python, you typically access the data via the CDS (Climate Data Store) API provided by ECMWF. Here's a basic step-by-step guide to do that:
+This project provides a Python module for retrieving ERA5 data  from the Copernicus Climate Data Store (CDS) using
+`ecmwf-datastores-client`.
 
-```Step 1: Set Up Your CDS API Key```
+### Step 1: Set up your CDS API credentials
 
-Register for a CDS account at ECMWF CDS. url: https://cds.climate.copernicus.eu/
+Register or sign in at the [Copernicus Climate Data Store](https://cds.climate.copernicus.eu/), then obtain your API key from the [API key page](https://cds.climate.copernicus.eu/how-to-api).
 
-After registration, you can find your url and key here: url: https://cds.climate.copernicus.eu/how-to-api
+Create a file named `.ecmwfdatastoresrc` in your home directory (on Windows, usually `C:\\Users\\<username>\\.ecmwfdatastoresrc`) with the following content:
 
-Set the API key by placing the .cdsapirc file in your home directory (C:\Users\username) with the following content:
-
-```python
-url: https://cds.climate.copernicus.eu/api/v2
-
-key: your-api-key
+```text
+url: https://cds.climate.copernicus.eu/api
+key: <your-personal-api-key>
 ```
 
-```Step 2: Install Required Packages```
-You need the cdsapi library to access ECMWF data. You can install it using:
+Keep this file private. Do not add your API key to the notebook or share it.
+
+### Step 2: Install the required packages
+
+Install the client used by `ERA5_loader.py` and its pandas dependency:
 
 ```python
-pip install cdsapi
+pip install ecmwf-datastores-client pandas
 ```
+
+Restart the notebook kernel after installation if the package was not already available.
+
+### Example of using
+```python
+from ERA5_loader import *
+
+request_infos = submit_era5_data(
+    output_dir="ERA5_data",
+    variable="2m_temperature",
+    start_date="01-01-2020",
+    end_date="31-01-2020",
+    mode="hourly",
+)
+# wait until your request will be accepted and then run
+download_era5_results()
+```
+### ERA5 grid resolution
+
+The current CDS Data Stores request schemas used here do not expose a custom `grid` parameter.
+Requests therefore use the native resolution of the selected ERA5 dataset. Leave
+`grid_resolution=None` (the default); a custom value is rejected explicitly by the loader.
+
+### Required parameter database
+
+The file `era5_parameters_database.csv` must be placed in the
+same directory as `ERA5_loader.py`.
+
+This file contains ERA5 variable metadata required by the loader.
+The module will raise a `FileNotFoundError` if the database is missing.
+
+# CDS API Request Queue Limit
+
+The Copernicus Climate Data Store (CDS) may temporarily reject data retrieval requests when the maximum number of queued requests for a specific dataset has been reached.
+
+This is a server-side limitation and does not necessarily indicate an error in the request parameters or the downloader itself. Even valid requests may be rejected during periods of high server demand.
+
+**Possible error message:**
+```text
+Maximum number queued requests for this dataset has been reached.
+Please configure your scripts to request data sequentially.
+```
+
+**What should you do?**
+
+- Make sure that no multiple instances of the downloader are running simultaneously.
+- Avoid submitting multiple requests to the same dataset at the same time.
+- If a request is rejected due to the queue limit, wait for some time before trying again.
+- Do not repeatedly resubmit rejected requests, as this may increase the load on the CDS service.
+
+The downloader uses sequential requests to reduce the likelihood of reaching this limit. However, queue availability also depends on the overall CDS server workload and requests submitted by other users.
+
+**Note:** This limitation is imposed by the CDS infrastructure and is outside the control of this downloader.
+
+# Recommended Time for Data Downloads
+
+CDS request processing times vary depending on the overall system workload. Although there is no officially guaranteed time when the request queue is least busy, downloads may be processed faster during off-peak hours.
+
+**Recommended practices:**
+
+- Consider submitting large data requests during nighttime or early morning hours (UTC), when user activity may be lower.
+- Avoid peak daytime periods when possible.
+- Check the current CDS queue status before starting large download operations: [CDS Live](https://cds.climate.copernicus.eu/live).
+- Monitor the queue status to identify periods of lower activity.
+- For large download operations, consider running the script overnight rather than during working hours.
+
+**Important:** Nighttime downloads are not guaranteed to be faster. CDS workload varies continuously and depends on
+dataset availability, request size, server capacity, and activity from other users. The recommended time window is
+a practical suggestion, not an official CDS scheduling policy.
+
+# CDS Processing Time and Request Expiration
+
+Even small requests (a few megabytes) may remain in the CDS queue for several hours before processing completes. Additionally, completed results are stored on CDS servers only temporarily and can expire if not downloaded in time.
+
+**Why small requests can take hours:**
+
+- **Shared CDS queue:** The total duration shown in the CDS portal (e.g., several hours) includes the waiting time in the shared user queue (`Accepted` / `Queued`) before a worker slot is assigned, not just the time required to extract the data. When other users submit large multi-terabyte requests ahead of yours, smaller requests must wait in line.
+- **MARS tape archive retrieval:** While frequently accessed ERA5 subsets reside on fast spinning disks, requests spanning many years or less common parameter combinations may require retrieving data from the ECMWF MARS tape archive, which significantly increases turnaround time.
+
+**Request expiration (`Expired` status):**
+
+- Completed files are retained in temporary CDS storage for a limited period—typically **24 to 72 hours** after completion (depending on current cache load, with 24 hours as the baseline retention window).
+- Once a request expires, its results are deleted from the CDS server and can no longer be downloaded.
+- **How this downloader handles expiration:** If a previously `successful` request has expired (`results_ready=False`), `check_era5_status()` and `download_era5_results()` automatically mark it as `expired` in `ERA5_requests.db`. Re-running `submit_era5_data()` with the same parameters will detect the expired status and automatically submit a fresh request.

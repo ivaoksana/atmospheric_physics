@@ -2,7 +2,6 @@ from ecmwf.datastores import Client
 
 import pandas as pd
 import os
-from datetime import datetime, date
 from numbers import Real
 from typing import Any
 import logging
@@ -11,10 +10,45 @@ from pathlib import Path
 import re
 import math
 import hashlib
+import tempfile
+import sqlite3
 import json
+from contextlib import contextmanager
+from datetime import datetime, date, timedelta
+import calendar
+
+# Color Formatter for Logs
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG': '\033[94m',
+        'INFO': '\033[92m',
+        'WARNING': '\033[93m',
+        'ERROR': '\033[91m',
+        'CRITICAL': '\033[1;41m'
+    }
+    RESET = '\033[0m'
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelname, self.RESET)
+        message = super().format(record)
+        return f"{color}{message}{self.RESET}"
+
+# Logger Factory
+def get_logger(name='default', level=logging.DEBUG) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = True
+
+    if not logger.hasHandlers():
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
+        formatter = ColorFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger
 
 REGIONS = {
-
     # ==================================================
     # GLOBAL AND POLAR REGIONS
     # ==================================================
@@ -154,29 +188,112 @@ REGIONS = {
     "nino34": [5, -170, -5, -120],
     "nino3": [5, -150, -5, -90],
 }
-ERA5_PATH = Path(__file__).parent / "era5_parameters_database.csv"
-DATABASE_PATH = Path(__file__).parent / "ERA5_requests.db"
 
-def load_era5_database():
-    if not ERA5_PATH.exists():
+ERA5_PATH = Path(__file__).parent / "era5_parameters_database.csv"
+
+def load_era5_database() -> pd.DataFrame:
+    """
+    Load the ERA5 parameter database from a CSV file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Database containing ERA5 variable metadata.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the parameter database file does not exist.
+    ValueError
+        If required columns are missing from the database.
+    """
+    if not ERA5_PATH.is_file():
         raise FileNotFoundError(f"ERA5 parameter database not found: {ERA5_PATH}")
 
-    return pd.read_csv(
-        ERA5_PATH,
-        sep=";",
-        encoding="utf-8-sig"
-    )
+    database = pd.read_csv(ERA5_PATH, sep=";", encoding="utf-8-sig")
+
+    required_columns = {
+        "name",
+        "units",
+        "cds_variable",
+        "short_name",
+        "level_type",
+        "parameter_type"
+    }
+
+    missing_columns = required_columns.difference(database.columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"ERA5 parameter database is missing required columns: {sorted(missing_columns)}"
+        )
+
+    return database
 
 def search_era5_variables(
-    keyword,
-    level_type=None,
-    parameter_type=None
-):
+        keyword: str,
+        level_type: str | None = None,
+        parameter_type: str | None = None
+    ) -> pd.DataFrame:
+    """
+    Search the ERA5 parameter database by variable name or metadata.
+
+    Parameters
+    ----------
+    keyword : str
+        Search keyword. Matches variable name, CDS variable or short name.
+    level_type : str, optional
+        Filter by vertical level type (e.g. 'single_levels',
+        'pressure_levels').
+    parameter_type : str, optional
+        Filter by parameter type (e.g. 'dynamics', 'thermodynamics',
+        'accumulations').
+
+    Returns
+    -------
+    pd.DataFrame
+        Matching ERA5 variables and their metadata.
+
+    Raises
+    ------
+    TypeError
+        If keyword or an optional filter is not a string.
+    ValueError
+        If a search argument is empty or no matching variables are found.
+    """
+
+    # Validate search arguments
+    if not isinstance(keyword, str):
+        raise TypeError("'keyword' must be a string.")
+
+    keyword = keyword.strip()
+
+    if not keyword:
+        raise ValueError("'keyword' must not be empty.")
+
+    for name, value in [
+        ("level_type", level_type),
+        ("parameter_type", parameter_type)
+    ]:
+        if value is not None:
+            if not isinstance(value, str):
+                raise TypeError(f"'{name}' must be a string or None.")
+
+            if not value.strip():
+                raise ValueError(f"'{name}' must not be empty.")
+
+    if level_type is not None:
+        level_type = level_type.strip()
+
+    if parameter_type is not None:
+        parameter_type = parameter_type.strip()
+
+    # Load parameter database
     database = load_era5_database()
 
+    # Search variable metadata
     search_columns = ["name", "cds_variable", "short_name"]
 
-    # Search by keyword
     mask = pd.Series(False, index=database.index)
 
     for column in search_columns:
@@ -189,7 +306,7 @@ def search_era5_variables(
 
     result = database[mask].copy()
 
-    # Filter by level type
+    # Apply optional filters
     if level_type is not None:
         result = result[
             result["level_type"].str.contains(
@@ -200,7 +317,6 @@ def search_era5_variables(
             )
         ]
 
-    # Filter by parameter type
     if parameter_type is not None:
         result = result[
             result["parameter_type"].str.contains(
@@ -210,25 +326,23 @@ def search_era5_variables(
                 regex=False
             )
         ]
+
     if result.empty:
         raise ValueError(
             f"No parameters found for keyword '{keyword}' "
-            f"with level_type={level_type} and parameter_type={parameter_type}."
+            f"with level_type={level_type} and "
+            f"parameter_type={parameter_type}."
         )
 
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 200)
-    pd.set_option("display.max_colwidth", 40)
-    pd.set_option("display.expand_frame_repr", True)
-
-    print(f"There are following variables with keyword '{keyword}', "
-          f"level_type:{level_type}, parameter_type:{parameter_type}:")
-
-    output = (
-        result.reset_index(drop=True)[
-            ["name", "units", "cds_variable", "level_type", "parameter_type"]
-        ].to_string(index=False)
+    # Display matching variables
+    print(
+        f"Matching ERA5 variables for '{keyword}' "
+        f"(level_type={level_type}, parameter_type={parameter_type}):"
     )
+
+    output = result.reset_index(drop=True)[
+        ["name", "units", "cds_variable", "level_type", "parameter_type"]
+    ].to_string(index=False, max_colwidth=40)
 
     separator = "-" * max(len(line) for line in output.splitlines())
 
@@ -240,55 +354,36 @@ def search_era5_variables(
 
     return result.reset_index(drop=True)
 
-# Color Formatter for Logs
-class ColorFormatter(logging.Formatter):
-    COLORS = {
-        'DEBUG': '\033[94m',
-        'INFO': '\033[92m',
-        'WARNING': '\033[93m',
-        'ERROR': '\033[91m',
-        'CRITICAL': '\033[1;41m'
-    }
-    RESET = '\033[0m'
-
-    def format(self, record):
-        color = self.COLORS.get(record.levelname, self.RESET)
-        message = super().format(record)
-        return f"{color}{message}{self.RESET}"
-
-
-# Logger Factory
-def get_logger(name='default', level=logging.DEBUG) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    logger.propagate = True
-
-    if not logger.hasHandlers():
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(level)
-        formatter = ColorFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    return logger
-
-import sqlite3
-import json
-from pathlib import Path
-
+DATABASE_PATH = Path(__file__).parent / "ERA5_requests.db"
 
 class ERA5RequestDatabase:
+    """
+    Manage ERA5 request records stored in an SQLite database.
 
-    def __init__(self, db_path="ERA5_requests.db"):
+    The database tracks submitted CDS requests, their processing
+    status, download information and request configuration hashes.
+    """
+
+    def __init__(self, db_path=DATABASE_PATH):
 
         self.db_path = Path(db_path)
 
         self._create_table()
 
-
+    @contextmanager
     def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
 
-        return sqlite3.connect(self.db_path)
+        try:
+            yield conn
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        finally:
+            conn.close()
 
 
     def _create_table(self):
@@ -376,31 +471,37 @@ class ERA5RequestDatabase:
             "error"
         }
 
-        updates = {
-            key: value
-            for key, value in kwargs.items()
-            if key in allowed_fields
-        }
+        unknown_fields = set(kwargs) - allowed_fields
+
+        if unknown_fields:
+            raise ValueError(
+                f"Unsupported fields for request update: {sorted(unknown_fields)}"
+            )
+
+        updates = kwargs.copy()
 
         if not updates:
             return
 
         if "downloaded" in updates:
+            if not isinstance(updates["downloaded"], bool):
+                raise TypeError("'downloaded' must be a bool.")
+
             updates["downloaded"] = int(updates["downloaded"])
 
-        columns = ", ".join(
-            f"{key} = ?" for key in updates
-        )
+        columns = ", ".join(f"{key} = ?" for key in updates)
 
         values = list(updates.values())
         values.append(request_id)
 
         with self._connect() as conn:
-
-            conn.execute(
+            cursor = conn.execute(
                 f"UPDATE requests SET {columns} WHERE request_id = ?",
                 values
             )
+
+            if cursor.rowcount == 0:
+                raise KeyError(f"No ERA5 request found with ID: {request_id}")
 
     def get_request_by_hash(self, request_hash):
         """Retrieve a request using its configuration hash."""
@@ -413,7 +514,7 @@ class ERA5RequestDatabase:
                      SELECT *
                 FROM requests
                 WHERE request_hash = ?
-                AND status NOT IN ('failed', 'deleted')
+                AND COALESCE(status, '') NOT IN ('failed', 'rejected', 'deleted', 'expired')
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -478,24 +579,561 @@ class ERA5RequestDatabase:
 
             return results
 
+PRESSURE_LEVELS_ALL = [
+    1000, 975, 950, 925, 900, 875, 850, 825, 800, 775,
+    750, 700, 650, 600, 550, 500, 450, 400, 350, 300,
+    250, 225, 200, 175, 150, 125, 100, 70, 50, 30,
+    20, 10, 7, 5, 3, 2, 1
+] # All available pressure levels in hPa
+
+def _normalize_date(value, name, allow_none=False):
+    """Convert a date input to a datetime object."""
+
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"'{name}' must not be None.")
+
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value.strip(), "%d-%m-%Y")
+        except ValueError:
+            raise ValueError(f"'{name}' must have format 'DD-MM-YYYY'.") from None
+
+    raise TypeError(
+        f"'{name}' must be a datetime, date, or string in 'DD-MM-YYYY' format."
+    )
+
+def _build_output_filename(
+    request_config,
+    request_hash,
+):
+    """Generate an output filename for an ERA5 request batch."""
+
+    variable = request_config["variable"][0]
+    pressure_levels = request_config["pressure_levels"]
+    mode = request_config["mode"]
+    batch_start = request_config["start_date"]
+    batch_end = request_config["end_date"]
+    if mode == "daily":
+        daily_statistic = request_config["daily_statistic"]
+
+    # Determine vertical level suffix
+    level_suffix = "_pressure" if pressure_levels is not None else "_single"
+
+    # Determine mode suffix and date format
+    if mode == "hourly":
+        mode_suffix = "hourly"
+        date_format = "%Y%m%d"
+
+    elif mode == "daily":
+        mode_suffix = (
+            daily_statistic
+            if daily_statistic.startswith("daily_")
+            else f"daily_{daily_statistic}"
+        )
+        date_format = "%Y%m%d"
+
+    elif mode == "monthly":
+        mode_suffix = "monthly"
+        date_format = "%Y%m"
+
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    # Define period suffix
+    start_label = batch_start.strftime(date_format)
+    end_label = batch_end.strftime(date_format)
+
+    period_suffix = (
+        start_label
+        if start_label == end_label
+        else f"{start_label}-{end_label}"
+    )
+
+    # Determine file extension
+    if mode == "daily":
+        extension = ".zip"
+    elif request_config["file_format"] == "netcdf":
+        extension = ".nc"
+    else:
+        extension = ".grib"
+
+    # Generate filename
+    filename = (
+        f"{variable}{level_suffix}_"
+        f"{mode_suffix}_"
+        f"{period_suffix}_"
+        f"{request_hash[:8]}"
+        f"{extension}"
+    )
+
+    return filename
+
+
+def _generate_request_batches(
+        request_config,
+        max_fields_per_batch=50000,
+        max_uncompressed_mb_per_batch=30000,
+        logging_on=False,
+):
+    """
+    Generate calendar-aware ERA5 request batches based on temporal,
+    spatial, and memory constraints.
+
+    Requests are split into calendar-aware batches to limit the estimated
+    processing workload and uncompressed output size.
+
+    For Daily Statistics, request workload units account for the selected
+    sub-daily frequency (1-, 3-, or 6-hourly). Memory estimates, however,
+    are based on the actual daily output fields (one field per day,
+    pressure level, and variable).
+
+    RAM estimates represent the theoretical size of uncompressed float32
+    arrays. They do not include additional memory overhead from data
+    decoding, temporary arrays, or intermediate processing operations.
+
+    Spatial grid-point counts, particularly for cropped areas, are
+    approximate and depend on grid alignment and coordinate conventions.
+
+    The function returns batch specifications and estimated memory
+    requirements. Actual CDS processing workload and peak memory usage
+    may differ from these estimates.
+
+    Parameters
+    ----------
+    request_config : dict
+        ERA5 request configuration. Expected to contain the temporal range,
+        data mode, variables, pressure levels, grid resolution, and other
+        settings required to estimate the size of each batch.
+
+    max_fields_per_batch : int, default=50000
+        Maximum number of workload units allowed in a batch.
+        For hourly and monthly modes, one workload unit corresponds
+        to one output field.
+        For Daily Statistics, workload units account for the
+        sub-daily frequency used to calculate daily statistics:
+            - 1_hourly: 24 workload units per output field.
+            - 3_hourly: 8 workload units per output field.
+            - 6_hourly: 4 workload units per output field.
+
+    max_uncompressed_mb_per_batch : int or float, default=30000
+        Maximum estimated uncompressed batch size, in decimal megabytes (MB).
+        The estimate is based on the number of grid points and assumes
+        4 bytes per value. It does not include memory overhead from
+        downloading, decoding, or processing the data.
+
+    logging_on : bool, default=False
+        If True, log information about the generated batches and their
+        estimated sizes.
+
+    Returns
+    -------
+    list of dict
+        Batch specifications. Each dictionary contains the temporal
+        parameters needed to build an individual ERA5 request.
+    """
+    logger = get_logger("generate_request_batches")
+
+
+    start_date = request_config["start_date"]
+    end_date = request_config["end_date"]
+
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+
+    mode = request_config["mode"]
+    grid_resolution = request_config["grid_resolution"]
+    variables = request_config["variable"]
+    pressure_levels = request_config["pressure_levels"]
+    times = request_config["times"]
+    area = request_config["area"]
+
+    # 1. Validate input parameters
+    if grid_resolution is None:
+        grid_lon = grid_lat = 0.25
+    else:
+        grid_lon, grid_lat = grid_resolution
+
+    if isinstance(variables, str):
+        num_vars = 1
+    elif isinstance(variables, (list, tuple)):
+        num_vars = len(variables)
+    else:
+        num_vars = int(variables)
+
+    if num_vars < 1:
+        raise ValueError("At least one variable is required")
+
+    # 2. Determine temporal steps
+    if mode == "daily":
+        frequency = request_config["frequency"]
+        freq_steps = {"1_hourly": 24, "3_hourly": 8, "6_hourly": 4}[frequency]
+        times_steps = 1
+    else:
+        freq_steps = 1
+        times_steps = (
+            len(times)
+            if times is not None
+            else (24 if mode == "hourly" else 1)
+        )
+
+    pressure_steps = len(pressure_levels) if pressure_levels is not None else 1
+    day_steps = (end_date - start_date).days + 1
+    month_steps = (
+            (end_date.year - start_date.year) * 12
+            + end_date.month - start_date.month + 1
+    )
+
+    # 3. Calculate workload units vs. actual output fields
+    if mode == "hourly":
+        total_output_fields = day_steps * times_steps * pressure_steps * num_vars
+        total_units = total_output_fields
+    elif mode == "daily":
+        total_output_fields = day_steps * pressure_steps * num_vars
+        total_units = total_output_fields * freq_steps
+    else:
+        total_output_fields = month_steps * times_steps * pressure_steps * num_vars
+        total_units = total_output_fields
+
+    # 4. Calculate spatial grid size (approximate when area is cropped)
+    if area is None:
+        lat_steps = round(180 / grid_lat) + 1
+        lon_steps = round(360 / grid_lon)
+    else:
+        north, west, south, east = area
+        if north < south:
+            raise ValueError("Area north must be >= south")
+
+        lat_steps = round((north - south) / grid_lat) + 1
+        lon_span = (east - west) % 360 if east < west else east - west
+        lon_steps = round(lon_span / grid_lon) + 1
+
+    grid_points = lat_steps * lon_steps
+    matrix_size_mb = grid_points * 4 / (1000 ** 2)
+
+    # 5. Estimate uncompressed RAM size (float32)
+    total_ram_mib = matrix_size_mb * total_output_fields
+
+    # 6. Calculate effective batch limit
+    max_output_by_memory = math.floor(max_uncompressed_mb_per_batch / matrix_size_mb)
+    if max_output_by_memory < 1:
+        raise ValueError("A single float32 matrix exceeds the memory limit.")
+
+    max_units_by_memory = max_output_by_memory * freq_steps
+    effective_max_units = min(max_fields_per_batch, max_units_by_memory)
+
+    # 7. Generate calendar-aware batches
+    batches = []
+
+    if mode == "monthly":
+        units_per_month = num_vars * times_steps * pressure_steps
+
+        if units_per_month > effective_max_units:
+            raise ValueError("A single monthly request exceeds the batch limit. "
+                             "Split variables, times or pressure levels.")
+
+        units_per_year = units_per_month * 12
+        is_full_years = (start_date.month == 1 and end_date.month == 12)
+
+        if is_full_years and units_per_year <= effective_max_units:
+            years_per_batch = max(1, effective_max_units // units_per_year)
+            years = list(range(start_date.year, end_date.year + 1))
+            all_months = [f"{m:02d}" for m in range(1, 13)]
+
+            for i in range(0, len(years), years_per_batch):
+                chunk_years = years[i: i + years_per_batch]
+                n_units = len(chunk_years) * units_per_year
+
+                batches.append({
+                    "year": [str(y) for y in chunk_years],
+                    "month": all_months,
+                    "units": n_units,
+                    "output_fields": n_units,
+                })
+        else:
+            months_per_batch = min(12, effective_max_units // units_per_month)
+
+            for year in range(start_date.year, end_date.year + 1):
+                month_start = start_date.month if year == start_date.year else 1
+                month_end = end_date.month if year == end_date.year else 12
+                year_months = [f"{m:02d}" for m in range(month_start, month_end + 1)]
+
+                for i in range(0, len(year_months), months_per_batch):
+                    chunk_months = year_months[i: i + months_per_batch]
+                    n_units = len(chunk_months) * units_per_month
+
+                    batches.append({
+                        "year": [str(year)],
+                        "month": chunk_months,
+                        "units": n_units,
+                        "output_fields": n_units,
+                    })
+
+    else:
+        # Hourly and Daily: strictly split within each calendar month
+        # to avoid invalid date combinations like Feb 30 or Apr 31.
+        output_per_day = num_vars * times_steps * pressure_steps
+        units_per_day = output_per_day * freq_steps
+
+        if units_per_day > effective_max_units:
+            raise ValueError("A single day exceeds the batch limit. "
+                             "Split variables or pressure levels.")
+
+        days_per_batch = min(31, effective_max_units // units_per_day)
+        current_month = date(start_date.year, start_date.month, 1)
+
+        while current_month <= end_date:
+            next_month = date(
+                current_month.year + (current_month.month == 12),
+                (current_month.month % 12) + 1,
+                1,
+            )
+            last_day = next_month - timedelta(days=1)
+
+            d_start = max(start_date, current_month)
+            d_end = min(end_date, last_day)
+            month_days = [f"{d:02d}" for d in range(d_start.day, d_end.day + 1)]
+
+            for i in range(0, len(month_days), days_per_batch):
+                chunk_days = month_days[i: i + days_per_batch]
+                n_days = len(chunk_days)
+
+                batches.append({
+                    "year": [str(current_month.year)],
+                    "month": [f"{current_month.month:02d}"],
+                    "day": chunk_days,
+                    "units": n_days * units_per_day,
+                    "output_fields": n_days * output_per_day,
+                })
+
+            current_month = next_month
+
+    # 8. Estimate each batch size (empirical approximations)
+    for batch in batches:
+        batch_ram_mib = batch["output_fields"] * matrix_size_mb
+        batch["est_ram_mb"] = round(batch_ram_mib, 2)
+
+    # 9. Summary & Sanity Check
+    actual_units = sum(b["units"] for b in batches)
+    actual_output_fields = sum(b["output_fields"] for b in batches)
+    assert actual_output_fields == total_output_fields, (f"Output field mismatch: "
+                                                         f"{actual_output_fields} != {total_output_fields}")
+
+    assert actual_units == total_units, f"Batch unit mismatch: {actual_units} != {total_units}"
+
+    num_batches = len(batches)
+    max_batch_ram = max(b["est_ram_mb"] for b in batches)
+
+    def _format_size_mb(size_mb: float) -> str:
+        if size_mb < 1:
+            return f"{size_mb * 1000:.2f} KB"
+        if size_mb < 1000:
+            return f"{size_mb:.2f} MB"
+        return f"{size_mb / 1000:.2f} GB"
+
+    if logging_on:
+        logger.info(
+            f"Total output fields: {actual_output_fields:,}\n"
+            f"Number of batches: {num_batches}\n"
+            f"Effective batch limit (units): {effective_max_units:,}\n"
+            f"Estimated total RAM (float32): {_format_size_mb(total_ram_mib)}\n"
+            f"Maximum batch RAM (float32): {_format_size_mb(max_batch_ram)}\n"
+            f"Note: Estimates reflect uncompressed float32 arrays in memory; "
+            f"actual file size on disk depends on variable, encoding, and compression."
+        )
+        logger.warning(
+            "\n⚠️: Memory usage estimates are theoretical.\n"
+            "They represent uncompressed float32 arrays only and do not "
+            "include additional processing overhead.\n"
+            "Actual RAM usage may be higher due to data decoding, "
+            "temporary arrays and intermediate operations.\n"
+            "The maximum batch size is an estimate, not a guarantee "
+            "of actual peak memory usage.\n"
+        )
+
+
+    return batches
+
+
+def _build_request_parameters(
+                request_config,
+                batch
+            ):
+    """
+    Build CDS API request parameters for a single ERA5 batch.
+
+    Combines the ERA5 request configuration with the temporal parameters
+    of a batch generated by `generate_request_batches()`.
+
+    The function selects the appropriate CDS product type and constructs
+    the request parameters for Hourly, Daily Statistics, or Monthly data.
+    It also creates a copy of the request configuration with the start
+    and end dates corresponding to the batch.
+
+    For Monthly data, the standard monthly-averaged product is used when
+    `times` is None or contains only "00:00". Otherwise, the
+    monthly-averaged-by-hour-of-day product is selected.
+
+    Parameters
+    ----------
+    request_config : dict
+        ERA5 request configuration. Expected keys include `variable`,
+        `area`, `grid_resolution`, `mode`, `times`, `file_format`,
+        and `pressure_levels`. Daily Statistics additionally requires
+        `daily_statistic`, `frequency`, and `time_zone`.
+
+    batch : dict
+        A single batch specification returned by
+        `generate_request_batches()`. Expected keys include `year`,
+        `month`, and, for Hourly and Daily batches, `day`.
+
+    Returns
+    -------
+    tuple[dict, dict]
+        A tuple containing:
+
+        - A copy of `request_config` with `start_date` and `end_date`
+          set to the temporal boundaries of the batch.
+        - A dictionary of CDS API request parameters.
+
+    Notes
+    -----
+    Monthly batch dates span the first day of the first month through
+    the last day of the last month in the batch.
+
+    Hourly and Daily batch dates are determined by the first and last
+    days listed in the batch.
+
+    The input `request_config` is not modified.
+    """
+    years = batch["year"]
+    months = batch["month"]
+
+    if "day" in batch:
+        days = batch["day"]
+    else:
+        days = ["01"]
+
+    variable = request_config["variable"]
+    area = request_config["area"]
+    mode = request_config["mode"]
+    times = request_config["times"]
+    file_format = request_config["file_format"]
+    pressure_levels = request_config["pressure_levels"]
+
+    request_params: dict[str, Any] = {
+        "variable": variable,
+        # The daily-statistics CDS schema accepts a single year string;
+        # hourly and monthly schemas accept a list of years.
+        "year": years[0] if mode == "daily" else years,
+        "month": months,
+    }
+    if area is not None:
+        request_params["area"] = area
+
+    if mode == "hourly":
+
+        request_params.update({
+            "product_type": ["reanalysis"],
+            "day": days,
+            "time": (times
+                if times is not None
+                else [f"{hour:02d}:00" for hour in range(24)]
+            ),
+            "data_format": file_format,
+            "download_format": "unarchived",
+        })
+
+    elif mode == "daily":
+
+        daily_statistic = request_config["daily_statistic"]
+        frequency = request_config["frequency"]
+        time_zone = request_config["time_zone"]
+
+        request_params.update({
+            # Daily-statistics schema defines product_type as a string.
+            "product_type": "reanalysis",
+            "day": days,
+            "daily_statistic": daily_statistic,
+            "time_zone": time_zone,
+            "frequency": frequency,
+        })
+        # Daily statistics are returned as NetCDF files in a ZIP archive.
+        # The current dataset schema does not accept download_format.
+
+        if pressure_levels is not None:
+            request_params["pressure_level"] = pressure_levels
+
+
+    elif mode == "monthly":
+
+        if times is None or list(times) == ["00:00"]:
+            request_params.update({
+                "product_type": ["monthly_averaged_reanalysis"],
+                "data_format": file_format,
+                "download_format": "unarchived",
+                "time": ["00:00"],
+            })
+        else:
+            request_params.update({
+                "product_type": ["monthly_averaged_reanalysis_by_hour_of_day"],
+                "data_format": file_format,
+                "download_format": "unarchived",
+                "time": list(times),
+            })
+
+    if mode == "hourly" and pressure_levels is not None:
+        request_params["pressure_level"] = pressure_levels
+
+    if mode == "monthly" and pressure_levels is not None:
+        request_params["pressure_level"] = pressure_levels
+
+    request_config_per_batch = request_config.copy()
+
+    if mode == "monthly":
+        start_date = date( int(years[0]),int(months[0]),1)
+
+        end_date = date(int(years[-1]),int(months[-1]),
+                calendar.monthrange(int(years[-1]), int(months[-1]))[1])
+    else:
+        start_date = date(int(years[0]),int(months[0]),int(days[0]))
+
+        end_date = date(int(years[-1]),int(months[-1]),int(days[-1]))
+
+    request_config_per_batch["start_date"] = start_date
+    request_config_per_batch["end_date"] = end_date
+
+    return request_config_per_batch, request_params
+
 def submit_era5_data(
             output_dir,
             variable,
-            current_date,
+            start_date,
+            end_date=None,
             mode="hourly",
-            daily_statistic=None,
-            frequency="1_hourly",
+            frequency="6_hourly",
             time_zone="utc+00:00",
             times=None,
+            daily_statistic=None,
             pressure_levels=None,
             adjust_pressure_levels=False,
             area=None,
             grid_resolution=None,
-            file_format="grib",
-            logging=True,
+            file_format=None,
+            logging_on=True,
         ):
         """
-        Submit one ERA5 file for a specified date.
+        Submit one ERA5 data for a specified date or time period.
 
         Parameters
         ----------
@@ -505,10 +1143,11 @@ def submit_era5_data(
         variable : str
             ERA5 variable to download (e.g., "2m_temperature").
 
-        current_date : str, datetime or date
-            Target date in "DD-MM-YYYY" format, datetime or date object.
-            The date represents a single day for hourly and daily modes,
-            or a month for monthly mode.
+        start_date : str
+            Start date in "DD-MM-YYYY" format, datetime or date object.
+
+        end_date : str
+            End date in "DD-MM-YYYY" format, datetime or date object.
 
         mode : str, default "hourly"
             Temporal processing mode:
@@ -516,15 +1155,7 @@ def submit_era5_data(
             - "daily": daily statistics derived from hourly data.
             - "monthly": monthly averaged ERA5 data.
 
-        daily_statistic : str, optional
-            Daily statistic to retrieve in daily mode.
-            Available options depend on the dataset and variable.
-            For pressure-level data, daily mean, maximum and minimum
-            are available. Daily sum is available only for supported
-            accumulated single-level variables.
-            If None, the default daily statistic is used.
-
-        frequency : str, default "1_hourly"
+        frequency : str, default "6_hourly"
             Sub-daily sampling frequency used to calculate daily
             statistics. Used only in daily mode.
 
@@ -534,12 +1165,22 @@ def submit_era5_data(
 
         times : list of str, optional
             Requested hours in "HH:MM" format (e.g., ["00:00", "06:00"]).
-            Used only in hourly mode. If None, all 24 hourly time steps
+            Used in hourly mode and in monthly averaged reanalysis by hour of day .
+            If None, all 24 hourly time steps
             are requested.
 
-        pressure_levels : list of str, int or float, optional
+        daily_statistic : str, optional
+            Daily statistic to retrieve in daily mode.
+            Available options depend on the dataset and variable.
+            For pressure-level data, daily mean, maximum and minimum
+            are available. Daily sum is available only for supported
+            accumulated single-level variables.
+            If None, the default daily statistic is used.
+
+        pressure_levels : str, list of str, int or float, optional
             Pressure levels in hPa. Values must be integer levels.
             If None, single-level data are requested.
+            If 'all', all available pressure level will be used
 
         adjust_pressure_levels : bool, default False
             Controls how unavailable pressure levels are handled.
@@ -558,24 +1199,54 @@ def submit_era5_data(
             Geographic bounding box in the format
             [North, West, South, East].
 
-        grid_resolution : list of float or str, optional
-            Output grid resolution in [dLon, dLat] format.
-            Can also be provided as a slash-separated string, e.g. "0.25/0.25".
-            If None, the dataset default resolution is used.
+        grid_resolution : None, optional
+            Custom grid resolution is not supported by the current CDS
+            Data Stores request schemas used by this function. The native
+            dataset resolution is used. Any non-None value raises ValueError.
 
-        file_format : str, default "grib"
+        file_format : str, optional
             Output data format: "netcdf" or "grib".
-            For daily statistics:
-            - GRIB data are downloaded unarchived.
-            - NetCDF data are downloaded as ZIP archives.
 
-        logging : bool, default=True
+            If None:
+            - "hourly": defaults to "grib".
+            - "daily": defaults to "netcdf".
+            - "monthly": defaults to "grib".
+
+            Daily statistics are provided as NetCDF files
+            inside ZIP archives.
+
+        logging_on : bool, default=True
             Enable logging.
 
         Returns
         -------
-        str
-            Path to the downloaded file.
+        list of dict
+            Information about each ERA5 request batch processed.
+            Each dictionary may contain the following fields:
+
+            - request_id : str or None
+                CDS request identifier. None if the request was not submitted
+                or the output file already existed.
+            - dataset : str
+                CDS dataset identifier.
+            - request : dict or None
+                Parameters used to submit the CDS request.
+                None if the output file already existed.
+            - output_file : str
+                Expected path of the output file.
+            - status : str
+                CDS request status or local processing status, such as
+                "already_downloaded" or "submission_failed".
+            - created_at : str or None
+                CDS request creation timestamp.
+            - downloaded : bool
+                Whether the output file is marked as downloaded.
+            - request_hash : str
+                SHA-256 hash identifying the request configuration.
+            - existing : bool
+                Whether the request or output file already existed.
+            - error : str, optional
+                Error description if request submission failed.
         """
         logger = get_logger("download_era5_data")
 
@@ -589,41 +1260,30 @@ def submit_era5_data(
         if not isinstance(variable, str) or not variable.strip():
             raise ValueError("'variable' must be a non-empty string")
 
-        database = load_era5_database()
+        database_era5 = load_era5_database()
 
-        # Select variables according to level type
+        # 2.1 Select variables according to level type
         if pressure_levels is None:
             expected_level_type = "single_levels"
         else:
             expected_level_type = "pressure_levels"
 
-        valid_variables = database.loc[database["level_type"] == expected_level_type,"cds_variable"].dropna().unique()
+        valid_variables = database_era5.loc[database_era5["level_type"] ==
+                        expected_level_type,"cds_variable"].dropna().unique()
 
         if variable not in valid_variables:
             raise ValueError(f"Variable '{variable}' is not available for '{expected_level_type}'. "
                              f"Valid variables are: {valid_variables}")
 
-        # 3. Validate date
-        if isinstance(current_date, datetime):
-            pass
+        # 3. Validate dates
+        start_date = _normalize_date(start_date, "start_date")
+        end_date = _normalize_date(end_date, "end_date", allow_none=True)
 
-        elif isinstance(current_date, date):
-            current_date = datetime.combine(current_date, datetime.min.time())
+        if end_date is None:
+            end_date = start_date
 
-        elif isinstance(current_date, str):
-            try:
-                current_date = datetime.strptime(current_date, "%d-%m-%Y")
-            except ValueError:
-                raise ValueError("'current_date' must have format 'DD-MM-YYYY'") from None
-
-        else:
-            raise TypeError(
-                "'current_date' must be a datetime, date, or string in 'DD-MM-YYYY' format"
-            )
-
-        year = str(current_date.year)
-        month = f"{current_date.month:02d}"
-        day = f"{current_date.day:02d}"
+        if start_date > end_date:
+            raise ValueError("'start_date' must not be later than 'end_date'.")
 
         # 4. Validate mode
         valid_modes = {"hourly", "daily", "monthly"}
@@ -631,26 +1291,43 @@ def submit_era5_data(
         if mode not in valid_modes:
             raise ValueError(f"'mode' must be one of {valid_modes}")
 
-        # 5. Validate file format
-        if not isinstance(file_format, str):
-            raise TypeError("'file_format' must be a string.")
+        if mode == "daily":
+            # 5. Validate frequency
+            if not isinstance(frequency, str):
+                raise TypeError("'frequency' must be a string")
 
-        file_format = file_format.strip().lower()
+            frequency = frequency.strip().lower()
+            valid_frequencies = {"1_hourly", "3_hourly", "6_hourly"}
 
-        if file_format not in {"netcdf", "grib"}:
-            raise ValueError("'file_format' must be 'netcdf' or 'grib'.")
+            if frequency not in valid_frequencies:
+                raise ValueError(f"'frequency' must be one of: {', '.join(sorted(valid_frequencies))}")
 
-        elif file_format == "netcdf":
-            if logging:
-                logger.warning("The native format of MARS datasets is GRIB,"
-                  " and this format is recommended for any operational use, such as deriving downstream products. "
-                  "Please note that to ensure that data is accurate and sufficient metadata is included in the output,"
-                  " your request may be split into multiple files when converted to netCDF.")
+            if logging_on:
+                logger.info("Selected sampling frequency: %s", frequency)
 
-        # 6. Validate times
+            # 6. Validate time zone
+            if not isinstance(time_zone, str):
+                raise TypeError("'time_zone' must be a string")
+
+            time_zone = time_zone.strip().lower()
+
+            valid_time_zones = {
+                f"utc{sign}{hour:02d}:00"
+                for sign, hours in [("-", range(1, 13)), ("+", range(0, 15))]
+                for hour in hours
+            }
+
+            if time_zone not in valid_time_zones:
+                raise ValueError("'time_zone' must be between UTC-12:00 and UTC+14:00. "
+                                 "Example: 'utc+00:00', 'utc+01:00', 'utc-05:00'.")
+
+            if logging_on:
+                logger.info("Selected time zone: %s", time_zone.upper())
+
+        # 7. Validate times
         if times is not None:
 
-            if logging:
+            if logging_on:
                 logger.info("Sub-daily data for the HRES (stream=oper/wave) the analyses (type=an) are available hourly."
                         " The short forecasts, run twice daily from 06 and 18 UTC, provide hourly output forecast steps "
                         "from 0 to 18 hours (only steps 1 to 12 hours are available on the CDS disks). For the EDA, "
@@ -676,16 +1353,129 @@ def submit_era5_data(
             if len(times) != len(set(times)):
                 raise ValueError("'times' must not contain duplicate values.")
 
-        if mode != "hourly" and times is not None:
-            raise ValueError("'times' can only be specified in hourly mode")
+        if mode not in ["hourly", "monthly"] and times is not None:
+            raise ValueError("'times' can only be specified when mode is 'hourly' or 'monthly'.")
 
-        # 7. Validate area
+        # 8. Validate daily statistics
+        if mode == "daily":
+
+            if logging_on:
+
+                logger.info("Users can select to calculate daily statistics from 1 hour, "
+                            "3 hours and 6 hours data. ")
+
+            valid_statistics = {"mean", "maximum", "minimum", "sum"}
+
+            if daily_statistic is None:
+                daily_statistic = "mean"
+
+            if not isinstance(daily_statistic, str):
+                raise TypeError("'daily_statistic' must be a string or None")
+
+            daily_statistic = daily_statistic.strip().lower()
+
+            if daily_statistic not in valid_statistics:
+                raise ValueError(f"'daily_statistic' must be one of: {', '.join(sorted(valid_statistics))}")
+
+            # Validate daily sum
+            if daily_statistic == "sum":
+
+                if pressure_levels is not None:
+                    raise ValueError(
+                        "'daily_sum' is available only for single-level data, not pressure-level data."
+                    )
+
+                variable_info = database_era5.loc[
+                    (database_era5["cds_variable"] == variable)
+                    & (database_era5["level_type"] == "single_levels")
+                    ]
+
+                if not variable_info["parameter_type"].isin(["accumulations"]).any():
+                    raise ValueError(f"'daily_sum' is not available for variable '{variable}'. "
+                                     "Only supported accumulated single-level variables can be used.")
+
+            daily_statistic = f"daily_{daily_statistic}"
+
+        else:
+            if daily_statistic is not None:
+                raise ValueError("'daily_statistic' can only be specified when mode='daily'.")
+
+        # 9. Validate pressure levels
+        if pressure_levels == 'all':
+            pressure_levels = PRESSURE_LEVELS_ALL
+
+        if pressure_levels is not None:
+
+            if not isinstance(pressure_levels, (list, tuple)):
+                raise ValueError("'pressure_levels' must be a non-empty list or tuple.")
+            if not pressure_levels:
+                raise ValueError("'pressure_levels' must not be empty.")
+
+            if any(isinstance(level, bool) for level in pressure_levels):
+                raise TypeError("Boolean values are not valid pressure levels.")
+
+            try:
+                pressure_levels = [float(level) for level in pressure_levels]
+
+            except (TypeError, ValueError):
+                raise ValueError("Pressure levels must contain numeric values (str, int or float).") from None
+
+            if not all(math.isfinite(level) and level.is_integer() for level in pressure_levels):
+                raise ValueError("Pressure levels must be finite integer values in hPa.")
+
+            pressure_levels = [int(level) for level in pressure_levels]
+
+            # Check unavailable levels
+            if not isinstance(adjust_pressure_levels, bool):
+                raise TypeError("'adjust_pressure_levels' must be a bool.")
+
+            unavailable_levels = [
+                level for level in pressure_levels
+                if level not in PRESSURE_LEVELS_ALL
+            ]
+
+            if unavailable_levels:
+
+                suggestions = {
+                    level: min(
+                        PRESSURE_LEVELS_ALL,
+                        key=lambda x: abs(x - level)
+                    )
+                    for level in unavailable_levels
+                }
+
+                suggestion_text = ", ".join(f"{level} → {nearest}" for level, nearest in suggestions.items())
+
+                if not adjust_pressure_levels:
+                    raise ValueError(
+                        f"Unavailable pressure levels: {unavailable_levels}. "
+                        f"Nearest available levels: {suggestion_text}. "
+                        "Set adjust_pressure_levels=True to replace them or"
+                        " use only available pressure levels."
+                    )
+
+                if logging_on:
+                    logger.warning("Unavailable pressure levels will be replaced: %s",
+                                   suggestion_text)
+
+                pressure_levels = [suggestions.get(level, level) for level in pressure_levels]
+
+            # Remove duplicates and sort
+            pressure_levels = sorted(set(pressure_levels), reverse=True)
+
+            pressure_levels = [str(level) for level in pressure_levels]
+
+            if logging_on:
+                logger.info("Selected pressure levels (hPa): %s",pressure_levels)
+
+        # 10. Validate area
         if area is not None:
 
-            if logging:
+            if logging_on:
                 logger.info(
                     "Area input formats:\n"
-                    "  1. Predefined region name, e.g. 'NH', 'Europe', 'north_atlantic' (or North Atlantic).\n"
+                    "  1. Predefined region name, e.g. 'NH' (or 'northern_hemisphere'), "
+                    "'Europe' (or 'europe'), 'north_atlantic' (or North Atlantic).\n"
                     "  2. Custom coordinates: [North, West, South, East].\n"
                     "  * Longitude range: -180 to 180 degrees.\n"
                     "  * Latitude range: -90 to 90 degrees."
@@ -703,7 +1493,7 @@ def submit_era5_data(
 
                 area = REGIONS[region]
 
-                if logging:
+                if logging_on:
                     logger.info("Region '%s' selected. Area: %s", region, area)
 
             else:
@@ -727,206 +1517,44 @@ def submit_era5_data(
 
             area = [north, west, south, east]
 
-        # 8. Validate pressure levels
-        if pressure_levels is not None:
-
-            pressure_level_all = [
-                1000, 975, 950, 925, 900, 875, 850, 825, 800, 775,
-                750, 700, 650, 600, 550, 500, 450, 400, 350, 300,
-                250, 225, 200, 175, 150, 125, 100, 70, 50, 30,
-                20, 10, 7, 5, 3, 2, 1
-            ]
-
-            if not isinstance(pressure_levels, (list, tuple)) or not pressure_levels:
-                raise ValueError("'pressure_levels' must be a non-empty list or tuple.")
-
-            if any(isinstance(level, bool) for level in pressure_levels):
-                raise TypeError("Boolean values are not valid pressure levels.")
-
-            try:
-                pressure_levels = [float(level) for level in pressure_levels]
-            except (TypeError, ValueError):
-                raise ValueError("Pressure levels must contain numeric values (str, int or float).") from None
-
-            if not all(math.isfinite(level) and level.is_integer() for level in pressure_levels):
-                raise ValueError("Pressure levels must be finite integer values in hPa.")
-
-            pressure_levels = [int(level) for level in pressure_levels]
-
-            # Check unavailable levels
-            if not isinstance(adjust_pressure_levels, bool):
-                raise TypeError("'adjust_pressure_levels' must be a bool.")
-
-            unavailable_levels = [
-                level for level in pressure_levels
-                if level not in pressure_level_all
-            ]
-
-            if unavailable_levels:
-
-                suggestions = {
-                    level: min(
-                        pressure_level_all,
-                        key=lambda x: abs(x - level)
-                    )
-                    for level in unavailable_levels
-                }
-
-                suggestion_text = ", ".join(f"{level} → {nearest}" for level, nearest in suggestions.items())
-
-                if not adjust_pressure_levels:
-                    raise ValueError(
-                        f"Unavailable pressure levels: {unavailable_levels}. "
-                        f"Nearest available levels: {suggestion_text}. "
-                        "Set adjust_pressure_levels=True to replace them."
-                    )
-
-                if logging:
-                    logger.warning("Unavailable pressure levels will be replaced: %s",
-                                   suggestion_text)
-
-                pressure_levels = [suggestions.get(level, level) for level in pressure_levels]
-
-            # Remove duplicates and sort
-            pressure_levels = sorted(set(pressure_levels), reverse=True)
-
-            if logging:
-                logger.info("Selected pressure levels (hPa): %s",pressure_levels)
-
-        # 9. Validate grid resolution
+        # 11. Validate grid resolution
+        # The current CDS Data Stores process schemas for the ERA5
+        # hourly, daily-statistics and monthly datasets do not expose
+        # a custom 'grid' request parameter.
         if grid_resolution is not None:
+            raise ValueError(
+                "Custom 'grid_resolution' is not supported by the current "
+                "CDS Data Stores API for these ERA5 datasets. Use the "
+                "native dataset resolution by setting grid_resolution=None."
+            )
 
-            if logging:
-                logger.info(
-                    "The ERA5 reanalysis atmospheric data resolution is 0.25° and"
-                    " the ERA5 ensemble atmospheric data resolution is 0.5°."
-                    " The ERA5 wave data resolution is 0.5° and the ERA5 ensemble wave data resolution is 1.0°."
-                    " The ERA5-Land data resolution is on 0.1°." 
-                    " Output grid spacing can be changed using 'grid_resolution'.\n"
-                    " Grid resolution input formats:\n"
-                    "  1. List or tuple: [dLon, dLat], e.g. [0.25, 0.25].\n"
-                    "  2. Slash-separated string: 'dLon/dLat', e.g. '0.25/0.25'.\n"
-                    "  Values must be positive finite numbers in degrees."
-                    " Note: Values < 0.25° will not add real physical details, "
-                    "instead interpolation will be done on the server."
+        # 12. Validate file format
+        if file_format is None:
+            file_format = "netcdf" if mode == "daily" else "grib"
+
+        if not isinstance(file_format, str):
+            raise TypeError("'file_format' must be a string or None.")
+
+        file_format = file_format.strip().lower()
+
+        if file_format not in {"netcdf", "grib"}:
+            raise ValueError("'file_format' must be 'netcdf' or 'grib'.")
+
+        if mode == "daily" and file_format == "grib":
+            raise ValueError(
+                "Daily statistics support only NetCDF format. Use file_format='netcdf'."
+            )
+        if file_format == "netcdf" and mode != "daily":
+            if logging_on:
+                logger.warning(
+                    "The native format of MARS datasets is GRIB, "
+                    "and this format is recommended for operational use. "
+                    "When converted to NetCDF, a request may be split "
+                    "into multiple files to preserve data accuracy "
+                    "and sufficient metadata."
                 )
 
-            # Parse string input
-            if isinstance(grid_resolution, str):
-                try:
-                    grid_resolution = [float(value.strip()) for value in grid_resolution.split("/")]
-                except ValueError:
-                    raise ValueError("'grid_resolution' must have format 'dLon/dLat', e.g. '0.25/0.25'.") from None
-
-            # Validate structure
-            if not isinstance(grid_resolution, (list, tuple)) or len(grid_resolution) != 2:
-                raise ValueError("'grid_resolution' must be a list/tuple [dLon, dLat] or a string 'dLon/dLat'.")
-
-            # Validate values
-            if not all(
-                    isinstance(x, Real)
-                    and not isinstance(x, bool)
-                    and math.isfinite(x)
-                    and x > 0
-                    for x in grid_resolution
-            ):
-                raise ValueError(
-                    "Grid resolution values must be positive finite numbers."
-                )
-
-            grid_resolution = [float(x) for x in grid_resolution]
-
-            if logging:
-                logger.info("Selected grid resolution: dLon = %.4f°, dLat = %.4f°",
-                            grid_resolution[0], grid_resolution[1])
-
-        # 10. Validate daily statistics
-        if mode == "daily":
-
-            if logging:
-                logger.info("The data are available from the Climate Data Store (CDS) webforms: \n"
-                        " Derived ERA5 daily statistics on single levels from 1940 to present.\n"
-                        " Derived ERA5 daily statistics on pressure levels from 1940 to present \n"
-                        " Derived ERA5-Land daily statistics from 1950 to present.")
-                logger.info("Users can select to calculate daily statistics from 1 hour, 3 hours and 6 hours data. ")
-
-            valid_statistics = { "mean", "maximum", "minimum", "sum"}
-
-            valid_frequencies = {"1_hourly", "3_hourly", "6_hourly"}
-
-            valid_time_zones = {
-                f"utc{sign}{hour:02d}:00"
-                for sign, hours in [("-", range(1, 13)), ("+", range(0, 15))]
-                for hour in hours
-            }
-
-            if daily_statistic is None:
-                daily_statistic = "mean"
-
-            if not isinstance(daily_statistic, str):
-                raise TypeError("'daily_statistic' must be a string or None")
-
-            daily_statistic = daily_statistic.strip().lower()
-
-            if daily_statistic not in valid_statistics:
-                raise ValueError(f"'daily_statistic' must be one of: "
-                                 f"{', '.join(sorted(valid_statistics))}")
-
-            # Validate daily sum
-            if daily_statistic == "sum":
-
-                if pressure_levels is not None:
-                    raise ValueError(
-                        "'daily_sum' is available only for single-level data, "
-                        "not pressure-level data."
-                    )
-
-                variable_info = database.loc[
-                    (database["cds_variable"] == variable)
-                    & (database["level_type"] == "single_levels")
-                    ]
-
-                if not variable_info["parameter_type"].isin(["accumulations"]).any():
-                    raise ValueError(
-                        f"'daily_sum' is not available for variable '{variable}'. "
-                        "Only supported accumulated single-level variables can be used."
-                    )
-
-            daily_statistic = f"daily_{daily_statistic}"
-
-            if logging:
-                logger.info("Selected daily statistic: %s", daily_statistic)
-
-            # Validate frequency
-            if not isinstance(frequency, str):
-                raise TypeError("'frequency' must be a string")
-
-            frequency = frequency.strip().lower()
-
-            if frequency not in valid_frequencies:
-                raise ValueError(f"'frequency' must be one of: {', '.join(sorted(valid_frequencies))}")
-
-            if logging:
-                logger.info("Selected sampling frequency: %s", frequency)
-
-            # Validate time zone
-            if not isinstance(time_zone, str):
-                raise TypeError("'time_zone' must be a string")
-
-            time_zone = time_zone.strip().lower()
-
-            if time_zone not in valid_time_zones:
-                raise ValueError("'time_zone' must be between UTC-12:00 and UTC+14:00. "
-                                "Example: 'utc+00:00', 'utc+01:00', 'utc-05:00'.")
-
-            if logging:
-                logger.info("Selected time zone: %s",time_zone.upper())
-
-        else:
-            if daily_statistic is not None:
-                raise ValueError("'daily_statistic' can only be specified when mode='daily'.")
-
-        # 11. Select dataset
+        # 13. Select dataset
         is_pressure = pressure_levels is not None
 
         if mode == "hourly":
@@ -949,34 +1577,48 @@ def submit_era5_data(
                 if is_pressure
                 else "reanalysis-era5-single-levels-monthly-means"
             )
-            if logging:
+            if logging_on:
                 logger.info("Monthly averaged reanalysis and Monthly averaged ensemble members data "
                         "are produced by averaging all daily data. Monthly averages by hour of day "
                         "constitute the average over all data within the calendar month for every hour (UTC) "
                         "of the day in case of reanalysis or every third hour (UTC) of the day for ensemble members.")
 
+        client = Client()
+        authentication = client.check_authentication()
 
-        # 12. Define output file
-        request_date = (
-            current_date.strftime("%Y-%m")
-            if mode == "monthly"
-            else current_date.strftime("%Y-%m-%d")
-        )
-        # Define request configuration for unique filename
+        if logging_on:
+            logger.info("Dataset authentication: %s", authentication)
+
+        collection = client.get_collection(dataset)
+
+        if logging_on:
+            logger.info("Dataset: %s", collection.title)
+            logger.info("Dataset ID: %s", collection.id)
+            logger.info("Available period: %s – %s",
+                collection.begin_datetime,collection.end_datetime)
+
+        # 14. Check whether requested dates are within dataset availability
+        available_start = collection.begin_datetime.date()
+        available_end = collection.end_datetime.date()
+
+        if start_date.date() < available_start:
+            raise ValueError(f"Start date is earlier than dataset availability ({available_start}).")
+
+        if end_date.date() > available_end:
+            raise ValueError( f"End date is later than dataset availability ({available_end}).")
+
+        # 15. Define request configuration
         request_config = {
-            "variable": variable,
+            "variable": [variable],
             "mode": mode,
-            "date": request_date,
+            "start_date": start_date,
+            "end_date": end_date,
             "pressure_levels": pressure_levels,
             "times": sorted(times) if times is not None else None,
             "area": area,
             "grid_resolution": grid_resolution,
             "file_format": file_format,
-            "download_format": (
-                "unarchived" if mode == "daily" and file_format == "grib"
-                else "zip" if mode == "daily" and file_format == "netcdf"
-                else None
-            ),
+            "download_format": "zip" if mode == "daily" else None,
         }
 
         if mode == "daily":
@@ -986,397 +1628,268 @@ def submit_era5_data(
                 "time_zone": time_zone,
             })
 
-        # Generate short hash
-        config_string = json.dumps(
-            request_config,
-            sort_keys=True,
-            separators=(",", ":")
-        )
+        request_infos = []
 
-        request_hash = hashlib.sha256(config_string.encode("utf-8")).hexdigest()
-
-
-        # Check whether an identical request already exists
+        batches = _generate_request_batches(request_config, logging_on=logging_on)
         request_db = ERA5RequestDatabase(db_path=DATABASE_PATH)
 
-        existing_request = request_db.get_request_by_hash(request_hash)
+        for batch in batches:
 
-        if existing_request is not None:
+            request_config_per_batch, request_params_per_batch = _build_request_parameters(
+                request_config=request_config,
+                batch=batch
+            )
 
-            if existing_request["status"] not in {"failed", "deleted"}:
+            # Generate short hash
+            config_for_hash = request_config_per_batch.copy()
+            config_for_hash["start_date"] = request_config_per_batch["start_date"].isoformat()
+            config_for_hash["end_date"] = request_config_per_batch["end_date"].isoformat()
 
-                existing_request["existing"] = True
+            config_string = json.dumps(
+                config_for_hash,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
 
-                if logging:
-                    logger.info(
-                        f"Request already exists: {existing_request['request_id']} "
-                        f"(status: {existing_request['status']}). "
-                        "No new request submitted."
-                    )
+            request_hash = hashlib.sha256(config_string.encode("utf-8")).hexdigest()
 
-                return existing_request
+            # 16. Check whether an identical request already exists
+            existing_request = request_db.get_request_by_hash(request_hash)
 
-        level_suffix = "_pressure" if is_pressure else "_single"
-
-        if mode == "hourly":
-            date_suffix = f"{year}-{month}-{day}"
-            mode_suffix = "hourly"
-
-        elif mode == "daily":
-            date_suffix = f"{year}-{month}-{day}"
-            mode_suffix = f"daily_{daily_statistic}"
-
-        else:  # monthly
-            date_suffix = f"{year}-{month}"
-            mode_suffix = "monthly"
-
-        # Determine file extension
-        if mode == "daily":
-            extension = ".grib" if file_format == "grib" else ".zip"
-        else:
-            extension = ".grib" if file_format == "grib" else ".nc"
-
-        filename = (
-            f"{variable}{level_suffix}_"
-            f"{mode_suffix}_"
-            f"{date_suffix}_"
-            f"{request_hash[:8]}"
-            f"{extension}"
-        )
-
-        output_file = os.path.join(output_dir, filename)
-
-        # 13. Check existing file
-        if os.path.exists(output_file):
-            print(f"File already exists: {output_file}")
-
-            return {
-                "request_id": None,
-                "dataset": dataset,
-                "request": None,
-                "output_file": output_file,
-                "status": "already_downloaded",
-                "created_at": None,
-                "downloaded": True,
-                "request_hash": request_hash,
-                "existing": True,
-            }
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        # 14. Build request
-        request_params: dict[str, Any] = {
-            "variable": [variable],
-            "year": [year],
-            "month": [month],
-        }
-
-        if area is not None:
-            request_params["area"] = list(area)
-
-        if grid_resolution is not None:
-            request_params["grid"] = list(grid_resolution)
-
-        if mode == "hourly":
-
-            request_params.update({
-                "product_type": ["reanalysis"],
-                "day": [day],
-                "time": (
-                    list(times)
-                    if times is not None
-                    else [f"{hour:02d}:00" for hour in range(24)]
-                ),
-                "data_format": file_format
-            })
-
-        elif mode == "daily":
-
-            request_params.update({
-                "product_type": ["reanalysis"],
-                "day": [day],
-                "daily_statistic": daily_statistic,
-                "time_zone": time_zone,
-                "frequency": frequency,
-                "data_format": file_format,
-                "download_format": (
-                    "unarchived" if file_format == "grib" else "zip"
-                ),
-            })
-
-            if pressure_levels is not None:
-                request_params["pressure_level"] = pressure_levels
-
-        else:  # monthly
-
-            request_params.update({
-                "product_type": ["monthly_averaged_reanalysis"],
-                "data_format": file_format
-            })
-
-        if mode == "hourly" and pressure_levels is not None:
-            request_params["pressure_level"] = pressure_levels
-
-        if mode == "monthly" and pressure_levels is not None:
-            request_params["pressure_level"] = pressure_levels
-
-        # Submit a new request
-        remote = None
-
-        try:
-            print(f"Submitting ERA5 {mode} data: {output_file}")
-
-            client = Client()
-            remote = client.submit(dataset, request_params)
-
-        except Exception as e:
-            if logging:
-                logger.error("Request submission failed: %s", e)
-            return None
-
-        request_info = {
-            "request_id": remote.request_id,
-            "dataset": dataset,
-            "request": request_params,
-            "output_file": output_file,
-            "status": remote.status,
-            "created_at": str(remote.created_at),
-            "downloaded": False,
-            "request_hash": request_hash,
-            "existing": False,
-        }
-
-        try:
-            request_db.add_request(request_info)
-        except Exception as e:
-            if logging:
-                logger.error(
-                    "Request was submitted, but database operation failed. "
-                    "Request ID: %s. Error: %s",
-                    remote.request_id,
-                    e,
+            if existing_request is not None:
+                existing_request = check_era5_status(
+                    client,
+                    existing_request["request_id"],
+                    request_db,
+                    logging_on=logging_on
                 )
-            raise
 
-        if logging:
-            logger.info("Request submitted successfully.")
-            logger.info("Request ID: %s", request_info["request_id"])
-            logger.info("Status: %s", request_info["status"])
+                if existing_request is None:
+                    if logging_on:
+                        logger.error(
+                            "Could not refresh existing request with hash %s. "
+                            "Skipping to avoid submitting a duplicate.",
+                            request_hash,
+                        )
+                    continue
 
-        return request_info
+                status = existing_request["status"]
 
+                if status not in {"failed", "deleted", "expired", "rejected"}:
+                    existing_request["existing"] = True
+                    request_infos.append(existing_request)
 
-def submit_era5_data_for_period(
-        output_dir,
-        variable,
-        date_from,
-        date_to,
-        mode="hourly",
-        daily_statistic=None,
-        frequency="1_hourly",
-        time_zone="utc+00:00",
-        times=None,
-        pressure_levels=None,
-        adjust_pressure_levels=False,
-        area=None,
-        grid_resolution=None,
-        file_format="grib",
-        logging=True,
-    ):
-        """
-        Submit ERA5 data for a specified period.
+                    if logging_on:
+                        logger.info(
+                            "Request already exists: %s (status: %s). "
+                            "No new request submitted.",
+                            existing_request["request_id"],
+                            status,
+                        )
 
-        The function generates a sequence of dates based on the selected
-        mode and submits one file for each date or month using
-        submit_era5_data().
+                    continue
 
-        Downloads are performed sequentially.
-
-        Parameters
-        ----------
-        output_dir : str or os.PathLike
-            Directory where downloaded files will be saved.
-
-        variable : str
-            ERA5 variable to download (e.g., "2m_temperature").
-
-        date_from : str
-            Start date in "DD-MM-YYYY" format.
-
-        date_to : str
-            End date in "DD-MM-YYYY" format.
-
-        mode : str, default "hourly"
-            Temporal processing mode:
-            - "hourly": hourly ERA5 data, one file per day.
-            - "daily": daily statistics, one file per day.
-            - "monthly": monthly averaged data, one file per month.
-
-        daily_statistic : str, optional
-            Daily statistic to retrieve in daily mode.
-            Available options depend on the dataset and variable.
-            For pressure-level data, daily mean, maximum and minimum
-            are available. Daily sum is available only for supported
-            accumulated single-level variables.
-            If None, the default daily statistic is used.
-
-        frequency : str, default "1_hourly"
-            Sub-daily sampling frequency used to calculate daily
-            statistics. Used only in daily mode.
-
-        time_zone : str, default "utc+00:00"
-            Time zone used for daily aggregation.
-            Used only in daily mode.
-
-        times : list of str, optional
-            Requested hours in "HH:MM" format.
-            Used only in hourly mode. If None, all 24 hourly time steps
-            are requested.
-
-        pressure_levels : list of str or int, optional
-            Pressure levels in hPa.
-            If None, single-level data are requested.
-
-        adjust_pressure_levels : bool, default False
-            Controls how unavailable pressure levels are handled.
-
-            - False: Raise a ValueError if one or more requested pressure
-              levels are unavailable. The error message includes the nearest
-              available pressure levels as suggestions.
-            - True: Automatically replace unavailable pressure levels with
-              the nearest available levels.
-
-            Duplicate levels resulting from automatic replacement are removed,
-            and the final list is sorted in descending order.
-            Used only when pressure_levels is not None.
-
-        area : list of float, optional
-            Geographic bounding box in the format
-            [North, West, South, East].
-
-        grid_resolution : list of float or str, optional
-            Output grid resolution in [dLon, dLat] format.
-            Can also be provided as a slash-separated string, e.g. "0.25/0.25".
-            If None, the dataset default resolution is used.
-
-        file_format : str, default "grib"
-            Output data format: "netcdf" or "grib".
-            For daily statistics:
-            - GRIB data are downloaded unarchived.
-            - NetCDF data are downloaded as ZIP archives.
-
-        logging : bool, default=True
-            Enable logging.
-
-        Returns
-        -------
-        list of str
-            Paths to successfully downloaded files, ordered
-            chronologically.
-        """
-        logger = get_logger("download_era5_data_for_period")
-
-        request_infos = {}
-
-        valid_modes = {"hourly", "daily", "monthly"}
-
-        if mode not in valid_modes:
-            raise ValueError(f"'mode' must be one of {valid_modes}")
-
-        # Generate dates based on the selected mode
-
-        # Parse dates
-        try:
-            start_date = datetime.strptime(date_from, "%d-%m-%Y")
-            end_date = datetime.strptime(date_to, "%d-%m-%Y")
-
-        except (TypeError, ValueError):
-            raise ValueError("'date_from' and 'date_to' must have format 'DD-MM-YYYY'")
-
-        # Validate date range
-        if start_date > end_date:
-            raise ValueError("'date_from' must not be later than 'date_to'")
-
-        # Generate dates
-        if mode in {"hourly", "daily"}:
-
-            dates = pd.date_range(
-                start=start_date,
-                end=end_date,
-                freq="D"
+            # 17. Define files names
+            filename = _build_output_filename(
+                request_config=request_config_per_batch,
+                request_hash=request_hash
             )
 
-        elif mode == "monthly":
+            output_file = os.path.join(output_dir, filename)
 
-            dates = pd.date_range(
-                start=start_date.replace(day=1),
-                end=end_date.replace(day=1),
-                freq="MS"
-            )
+            # 13. Check existing file
+            if os.path.isfile(output_file) and os.path.getsize(output_file) > 0:
+                print(f"File already exists: {output_file}")
 
-        for i, dd in enumerate(dates):
+                request_info = {
+                    "request_id": None,
+                    "dataset": dataset,
+                    "request": None,
+                    "output_file": output_file,
+                    "status": "already_downloaded",
+                    "created_at": None,
+                    "downloaded": True,
+                    "request_hash": request_hash,
+                    "existing": True,
+                }
+                request_infos.append(request_info)
+                continue
+
+            os.makedirs(output_dir, exist_ok=True)
 
             try:
-                request_info = submit_era5_data(
-                    output_dir=output_dir,
-                    variable=variable,
-                    current_date=dd.strftime("%d-%m-%Y"),
-                    times=times,
-                    mode=mode,
-                    daily_statistic=daily_statistic,
-                    frequency=frequency,
-                    time_zone=time_zone,
-                    area=area,
-                    grid_resolution=grid_resolution,
-                    pressure_levels=pressure_levels,
-                    adjust_pressure_levels=adjust_pressure_levels,
-                    file_format=file_format,
-                    logging=logging if i==0 else False,
-                )
-
-                if logging and i != 0 and request_info is not None:
-
-                    if request_info.get("existing", False):
-                        logger.info("Existing request reused. No new submission.")
-                    else:
-                        logger.info("New request submitted successfully.")
-
-                    logger.info("Request ID: %s", request_info["request_id"])
-                    logger.info("Status: %s", request_info["status"])
-
-                if request_info:
-                    request_infos[dd] = request_info
+                print(f"Submitting ERA5 {mode} data: {output_file}")
+                remote = client.submit(dataset, request_params_per_batch)
 
             except Exception as e:
-                logger.error(f"Submitng failed for {dd.strftime('%Y-%m-%d')}: {e}")
+                if logging_on:
+                    logger.error("Request submission failed: %s", e)
+
+                request_infos.append({
+                    "request_id": None,
+                    "dataset": dataset,
+                    "request": request_params_per_batch,
+                    "output_file": output_file,
+                    "status": "submission_failed",
+                    "created_at": None,
+                    "downloaded": False,
+                    "request_hash": request_hash,
+                    "existing": False,
+                    "error": str(e),
+                })
+                continue
+
+            request_info = {
+                "request_id": remote.request_id,
+                "dataset": dataset,
+                "request": request_params_per_batch,
+                "output_file": output_file,
+                "status": remote.status,
+                "created_at": str(remote.created_at),
+                "downloaded": False,
+                "request_hash": request_hash,
+                "existing": False,
+            }
+
+            try:
+                request_db.add_request(request_info)
+
+            except Exception as e:
+                if logging_on:
+                    logger.error(
+                        "Request was submitted, but database_era5 operation failed. "
+                        "Request ID: %s. Error: %s",
+                        remote.request_id,
+                        e,
+                    )
+                raise
+
+            if logging_on:
+                logger.info("Request submitted successfully.")
+                logger.info("Request ID: %s", request_info["request_id"])
+                logger.info("Status: %s", request_info["status"])
+
+            request_infos.append(request_info)
 
         return request_infos
 
-def check_era5_status(request_id, request_db):
+def check_era5_status(client, request_id, request_db, logging_on=True):
+    """Refresh a CDS request's status in the local database.
 
-    client = Client(cleanup=False)
+    Return the updated database record, or None if the status check fails.
+    """
+    logger = get_logger("check_era5_status")
+    try:
+        remote = client.get_remote(request_id)
+        status = getattr(remote, "status", None)
+        results_ready = getattr(remote, "results_ready", True)
 
-    remote = client.get_remote(request_id)
+        if status == "successful" and not results_ready:
+            status = "expired"
 
-    request_db.update_request(
-        request_id,
-        status=remote.status,
-        started_at=(
-            str(remote.started_at)
-            if remote.started_at else None
-        ),
-        finished_at=(
-            str(remote.finished_at)
-            if remote.finished_at else None
+        if status is None:
+            print(f"CDS returned no status for request {request_id!r}")
+            return None
+
+        def to_db_timestamp(value):
+            if value is None:
+                return None
+            return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+        request_db.update_request(
+            request_id,
+            status=status,
+            started_at=to_db_timestamp(getattr(remote, "started_at", None)),
+            finished_at=to_db_timestamp(getattr(remote, "finished_at", None)),
         )
-    )
 
-    return request_db.get_request(request_id)
+        return request_db.get_request(request_id)
 
-def download_era5_results(request_db, logging=True):
-    """Download all completed ERA5 requests stored in the request database."""
+
+    except Exception as exc:
+
+        err_msg = str(exc).lower()
+
+        if "404" in err_msg or "not found" in err_msg:
+
+            if logging_on:
+                logger.warning("Request %s no longer exists on CDS (404). Marking as 'deleted'.", request_id)
+
+            request_db.update_request(
+                request_id,
+                status="deleted",
+                error=str(exc),
+            )
+
+            return request_db.get_request(request_id)
+
+        print(f"Could not refresh CDS request {request_id!r}: {exc}")
+
+        return None
+
+def download_era5_results(request_db=None, logging_on=True):
+    """
+    Download completed ERA5 requests stored in the request database.
+
+    The function checks the status of each submitted CDS request and
+    downloads the results when they become available.
+
+    Files are downloaded to temporary directories located inside their
+    respective output directories. After a successful download, the
+    temporary file is moved to its final destination.
+
+    Parameters
+    ----------
+    request_db : ERA5RequestDatabase
+        Database instance containing information about submitted ERA5
+        requests, including their IDs, statuses and output file paths.
+
+    logging_on : bool, default=True
+        Enable logging of download progress, status information and errors.
+
+    Returns
+    -------
+    list of dict
+        Results of requests processed during the current execution.
+
+        Each dictionary contains:
+        - request_id : str
+            CDS request identifier.
+        - output_file : str
+            Path to the output file.
+        - result : str, optional
+            Path to the successfully downloaded file.
+        - status : str
+            Processing status. Possible values include:
+            - "downloaded"
+            - "file_already_exists"
+            - "downloaded_db_update_failed"
+            - "file_exists_db_update_failed"
+            - "database_sync_failed"
+            - "failed"
+        - error : str, optional
+            Error description when a download or database operation fails.
+
+    Notes
+    -----
+    - Non-empty existing output files are treated as downloaded, and the
+      corresponding database record is synchronized when necessary.
+    - If a request is marked as downloaded but its output file is missing
+      or empty, the database flag is reset and the CDS request is checked
+      again for download readiness.
+    - Requests that are not yet completed or whose results are not
+      available are skipped.
+    - Downloaded files are stored in the output paths recorded in
+      the request database.
+    - Temporary files are automatically removed after processing.
+    - Existing final output files are not overwritten unless a new
+      temporary download has completed successfully.
+    """
 
     logger = get_logger("download_era5_results")
+
+    if request_db is None:
+        request_db = ERA5RequestDatabase()
 
     client = Client(cleanup=False)
 
@@ -1389,51 +1902,179 @@ def download_era5_results(request_db, logging=True):
         request_id = request_info.get("request_id")
         output_file = request_info.get("output_file")
 
-        # Skip requests that have already been downloaded
-        if request_info.get("downloaded", False):
-            continue
-
         if not request_id or not output_file:
             continue
 
+        if request_info.get("status") in {"expired", "failed", "rejected", "deleted"}:
+            continue
+
+        output_file = os.fspath(output_file)
+
+        # Check whether a non-empty output file already exists
+        file_exists = (
+                os.path.isfile(output_file)
+                and os.path.getsize(output_file) > 0
+        )
+
+        if file_exists:
+            # Synchronize the database if the file exists
+            # but is not marked as downloaded.
+            if not request_info.get("downloaded", False):
+
+                try:
+                    request_db.update_request(
+                        request_id,
+                        downloaded=True,
+                        downloaded_at=datetime.now().isoformat(),
+                        error=None
+                    )
+
+                except Exception as db_error:
+
+                    if logging_on:
+                        logger.error(
+                            "File exists, but database update failed "
+                            "for request %s: %s",
+                            request_id,
+                            db_error
+                        )
+
+                    downloaded_results.append({
+                        "request_id": request_id,
+                        "output_file": output_file,
+                        "status": "file_exists_db_update_failed",
+                        "error": str(db_error)
+                    })
+
+                    continue
+
+            if logging_on:
+                logger.info(
+                    "Output file already exists. Skipping download: %s",
+                    output_file
+                )
+
+            downloaded_results.append({
+                "request_id": request_id,
+                "output_file": output_file,
+                "status": "file_already_exists"
+            })
+
+            continue
+
+        # Database says downloaded, but the file is missing or empty.
+        # Reset the database flag and allow the request to be downloaded again.
+        if request_info.get("downloaded", False):
+
+            if logging_on:
+                logger.warning(
+                    "Request %s is marked as downloaded, "
+                    "but the output file is missing or empty. "
+                    "Attempting to download it again.",
+                    request_id
+                )
+
+            try:
+                request_db.update_request(
+                    request_id,
+                    downloaded=False,
+                    downloaded_at=None
+                )
+
+            except Exception as db_error:
+
+                if logging_on:
+                    logger.error(
+                        "Could not reset download status for request %s: %s",
+                        request_id,
+                        db_error
+                    )
+
+                downloaded_results.append({
+                    "request_id": request_id,
+                    "output_file": output_file,
+                    "status": "database_sync_failed",
+                    "error": str(db_error)
+                })
+                continue
         try:
             # Check the current status on CDS
             remote = client.get_remote(request_id)
+            status = getattr(remote, "status", None)
+            results_ready = getattr(remote, "results_ready", True)
+
+            if status == "successful" and not results_ready:
+                status = "expired"
 
             # Update the current request status in the database
-            request_db.update_request(
-                request_id,
-                status=remote.status
-            )
+            request_db.update_request(request_id, status=status)
 
-            # Download only completed requests
-            if remote.status != "successful" or not remote.results_ready:
+            # Download only completed requests whose results have not expired
+            if status != "successful" or not results_ready:
 
-                if logging:
+                if logging_on:
                     logger.info(
                         "Request %s is not ready. Current status: %s",
                         request_id,
-                        remote.status
+                        status
                     )
 
                 continue
 
-            output_file = os.fspath(output_file)
+            output_dir = os.path.dirname(output_file) or "."
+            os.makedirs(output_dir, exist_ok=True)
 
-            os.makedirs(
-                os.path.dirname(output_file) or ".",
-                exist_ok=True
-            )
+            # Download to a temporary directory first
+            with tempfile.TemporaryDirectory(
+                    prefix=".era5_download_", dir=output_dir
+            ) as temp_dir:
 
-            # Download the result
-            result = remote.download(output_file)
+                temp_output_file = os.path.join(temp_dir, os.path.basename(output_file))
+
+                remote.download(temp_output_file)
+
+                # Verify downloaded file
+                if not os.path.isfile(temp_output_file):
+                    raise RuntimeError(
+                        f"CDS download did not create expected file: {temp_output_file}"
+                    )
+
+                if os.path.getsize(temp_output_file) == 0:
+                    raise RuntimeError(f"Downloaded file is empty: {temp_output_file}")
+
+                # Move completed file to its final destination
+                os.replace(temp_output_file, output_file)
+
+            result = output_file
 
             # Update database after successful download
-            request_db.update_request(
-                request_id,
-                downloaded=True,
-                downloaded_at=datetime.now().isoformat()
-            )
+            try:
+                request_db.update_request(
+                    request_id,
+                    downloaded=True,
+                    downloaded_at=datetime.now().isoformat(),
+                    error=None
+                )
+
+            except Exception as db_error:
+
+                if logging_on:
+                    logger.error(
+                        "File downloaded, but database update failed "
+                        "for request %s: %s",
+                        request_id,
+                        db_error
+                    )
+
+                downloaded_results.append({
+                    "request_id": request_id,
+                    "output_file": output_file,
+                    "result": result,
+                    "status": "downloaded_db_update_failed",
+                    "error": str(db_error)
+                })
+
+                continue
 
             downloaded_results.append({
                 "request_id": request_id,
@@ -1442,42 +2083,53 @@ def download_era5_results(request_db, logging=True):
                 "status": "downloaded"
             })
 
-            if logging:
-                logger.info(
-                    "Request %s downloaded: %s",
-                    request_id,
-                    output_file
-                )
+            if logging_on:
+                logger.info("Request %s downloaded: %s", request_id, output_file)
 
+        # ---> ОСЬ ЦЕЙ ОСТАННІЙ БЛОК EXCEPT ДЛЯ ПОМИЛОК CDS API <---
         except Exception as e:
+            err_msg = str(e).lower()
+            is_not_found = "404" in err_msg or "not found" in err_msg
 
-            if logging:
-                logger.error(
-                    "Download failed for request %s: %s",
-                    request_id,
-                    e
-                )
+            if logging_on:
+                if is_not_found:
+                    logger.warning(
+                        "Request %s not found on CDS (404). Marking as 'deleted' in database.",
+                        request_id
+                    )
+                else:
+                    logger.error("Download failed for request %s: %s", request_id, e)
 
-            # Remove incomplete output file
-            if os.path.exists(output_file):
-                os.remove(output_file)
+            # Record download error (and mark as deleted if 404) without deleting local files
+            try:
+                update_kwargs = {"error": str(e)}
+                if is_not_found:
+                    update_kwargs["status"] = "deleted"
 
-            request_db.update_request(
-                request_id,
-                error=str(e)
-            )
+                request_db.update_request(request_id, **update_kwargs)
+
+            except Exception as db_error:
+
+                if logging_on:
+                    logger.error(
+                        "Could not save download error to database "
+                        "for request %s: %s",
+                        request_id,
+                        db_error
+                    )
 
             downloaded_results.append({
                 "request_id": request_id,
                 "output_file": output_file,
-                "status": "failed",
+                "status": "deleted" if is_not_found else "failed",
                 "error": str(e)
             })
 
-    if logging:
+    if logging_on:
         logger.info(
             "Download process completed. Downloaded %d of %d requests.",
-            sum(r["status"] == "downloaded" for r in downloaded_results),
+            sum(r["status"] in ("downloaded", "file_already_exists")
+                for r in downloaded_results),
             len(requests)
         )
     return downloaded_results
